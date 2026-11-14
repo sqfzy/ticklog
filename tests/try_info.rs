@@ -39,7 +39,7 @@ fn enqueue_results_match_delivered_records_without_waiting_for_the_sink() {
         assert!(!ticklog::try_info!("{}", "x".repeat(70_000)));
         let mut accepted = Vec::new();
         let mut rejected = 0;
-        for seq in 0..100_000_u64 {
+        for seq in 0..200_000_u64 {
             if ticklog::try_info!("{}", seq) {
                 accepted.push(seq.to_string());
             } else {
@@ -56,7 +56,7 @@ fn enqueue_results_match_delivered_records_without_waiting_for_the_sink() {
     worker.join().unwrap();
     let (accepted, rejected) = result.expect("producer waited for the sink");
     assert!(rejected > 0 && !accepted.is_empty());
-    assert_eq!(accepted.len() + rejected, 100_000);
+    assert_eq!(accepted.len() + rejected, 200_000);
     drop(guard);
     assert_eq!(*lines.lock().unwrap(), accepted);
 }

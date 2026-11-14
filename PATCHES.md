@@ -21,3 +21,9 @@ shutdown can incur the sleep plus OS scheduling delay.
 `tests/idle_sleep.rs` checks that live and exited producers created after idle
 are discovered and flushed without waiting for shutdown, and that the final
 record is drained when the guard is dropped.
+
+The opt-in `ring-8m` Cargo feature increases each producer's ring from 1 MiB
+to 8 MiB. Window's 21,000-record production bursts overflowed the default
+queue before the background thread could drain it. The larger queue holds
+the burst while preserving nonblocking Drop backpressure; it does not change
+the default capacity or guarantee lossless delivery to a slow sink.

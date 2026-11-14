@@ -37,7 +37,10 @@ pub(crate) struct Reservation {
 }
 
 /// Ring buffer capacity in bytes. Power of 2 for bitmask indexing.
+#[cfg(not(feature = "ring-8m"))]
 pub(crate) const RING_SIZE: usize = 1_048_576; // 1 MB
+#[cfg(feature = "ring-8m")]
+pub(crate) const RING_SIZE: usize = 8_388_608; // 8 MiB
 
 /// Round `n` up to the nearest multiple of `align`.
 /// `align` must be a power of 2.
@@ -289,6 +292,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "ring-8m"))]
     fn ring_size_is_1mb() {
         assert_eq!(RING_SIZE, 1024 * 1024);
     }
@@ -440,8 +444,10 @@ mod tests {
     #[test]
     fn bitmask_is_ring_size_minus_one() {
         let mask = (RING_SIZE - 1) as u64;
-        // For a 1MB ring, mask should be 0xFFFFF (20 bits of 1s).
+        #[cfg(not(feature = "ring-8m"))]
         assert_eq!(mask, 0xFFFFF);
+        #[cfg(feature = "ring-8m")]
+        assert_eq!(mask, 0x7FFFFF);
         // mask + 1 should be exactly RING_SIZE.
         assert_eq!(mask + 1, RING_SIZE as u64);
     }

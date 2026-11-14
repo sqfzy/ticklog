@@ -12,9 +12,9 @@ use std::sync::{Arc, Mutex};
 
 use ticklog::{Backpressure, Level, LogSink, info};
 
-/// Several times a 1 MB ring's capacity, so the producer must block and wait
+/// Exceeds even the optional 8 MiB ring's capacity, so the producer must wait
 /// for the drain repeatedly during the run.
-const PRODUCED: usize = 50_000;
+const PRODUCED: usize = 200_000;
 
 /// Records every accepted line for post-shutdown assertions.
 struct CaptureSink {
