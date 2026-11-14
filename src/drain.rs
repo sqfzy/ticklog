@@ -6,6 +6,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use crate::encode::{FIXED_SIZES, TAG_COUNT, TAG_STR};
 use crate::format::{self, Field, FormatSpec, Segment, Template};
@@ -19,10 +20,8 @@ use crate::sink::LogSink;
 use crate::thread_buf::REGISTRY;
 use crate::timestamp::{Calibration, format_iso8601, ticks_to_ns};
 
-/// Spin batch used when the drain is freshly idle or has just done work.
-const SPIN_MIN: u32 = 8;
-/// Upper bound on the spin batch. Caps worst-case wakeup latency.
-const SPIN_CAP: u32 = 256;
+/// Yield the CPU between empty polls; producers keep enqueueing independently.
+const IDLE_SLEEP: Duration = Duration::from_millis(1);
 /// Re-scan the ring registry once every this many poll iterations. Must be a
 /// power of two so the free-running sync counter stays aligned across its u32
 /// wrap. Bounds how stale the drain's local ring list can become without
@@ -279,8 +278,6 @@ impl Drain {
         let mask = (RING_SIZE - 1) as u64;
         // Reused across every record; cleared per record. No per-record alloc.
         let mut buf = Vec::with_capacity(4096);
-        // Idle backoff counter. The idle path reads no clock and takes no lock.
-        let mut spin = SPIN_MIN;
         // Free-running ring-sync cadence counter; wraps at u32::MAX.
         let mut since_sync: u32 = 0;
 
@@ -300,12 +297,11 @@ impl Drain {
             // wrap, so every SYNC_EVERY-th pass syncs. A ring registered between
             // syncs keeps its records in its own buffer until the next sync.
             if (since_sync & SYNC_MASK) == 0 {
-                self.sync_rings(mask, &mut buf);
+                dirty |= self.sync_rings(mask, &mut buf);
             }
             since_sync = since_sync.wrapping_add(1);
 
             if self.poll_once(mask, &mut buf) {
-                spin = SPIN_MIN; // work found: reset backoff and re-poll now
                 dirty = true;
                 continue;
             }
@@ -317,11 +313,10 @@ impl Drain {
                 dirty = false;
             }
 
-            // Idle: back off with a capped, doubling spin. No clock, no lock.
-            for _ in 0..spin {
-                std::hint::spin_loop();
-            }
-            spin = (spin << 1).min(SPIN_CAP); // no overflow: capped
+            std::thread::sleep(IDLE_SLEEP);
+            // Discover producers created while asleep on the next pass, not
+            // after 1024 sleeps. Busy draining retains the coarse sync cadence.
+            since_sync = 0;
         }
 
         // Final pass: pick up any last records, including from rings whose
@@ -343,8 +338,9 @@ impl Drain {
     /// Syncs the drain's local ring list with the global registry: adds newly
     /// registered rings, and gives each ring whose producer has exited one final
     /// drain before dropping it. The registry lock is released before that
-    /// drain, so sink I/O never runs under the lock.
-    fn sync_rings(&mut self, mask: u64, buf: &mut Vec<u8>) {
+    /// drain, so sink I/O never runs under the lock. Returns whether an exited
+    /// producer's records were drained, so the idle path also flushes them.
+    fn sync_rings(&mut self, mask: u64, buf: &mut Vec<u8>) -> bool {
         let mut registry = REGISTRY
             .get()
             .expect("invariant: ring registry must be initialized by configure! before the drain starts")
@@ -374,12 +370,13 @@ impl Drain {
         // drain captures every record it published before exiting. That is the
         // guarantee the live flag exists to provide.
         let mut i = 0;
+        let mut had_work = false;
         while i < self.rings.len() {
             if self.rings[i].live.load(Ordering::Acquire) {
                 i += 1;
             } else {
                 let ring = self.rings.swap_remove(i);
-                drain_ring(
+                had_work |= drain_ring(
                     &ring,
                     mask,
                     self.sink.as_mut(),
@@ -390,6 +387,7 @@ impl Drain {
                 );
             }
         }
+        had_work
     }
 
     /// Drains every ring once, emitting all records published since the last
@@ -1406,7 +1404,7 @@ mod tests {
 
         let mask = (RING_SIZE - 1) as u64;
         let mut buf = Vec::new();
-        drain.sync_rings(mask, &mut buf);
+        assert!(drain.sync_rings(mask, &mut buf));
 
         // The dead ring's record must reach the sink before the ring is dropped.
         let recorded = calls.lock().unwrap();

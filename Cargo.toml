@@ -6,7 +6,7 @@ edition = "2024"
 keywords = ["logging", "low-latency", "performance"]
 license = "MIT OR Apache-2.0"
 name = "ticklog"
-repository = "https://github.com/tensorbinge/ticklog"
+repository = "https://github.com/sqfzy/ticklog"
 rust-version = "1.85"
 version = "0.1.2"
 

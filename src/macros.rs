@@ -43,7 +43,7 @@ pub fn dispatch(
     args_total: usize,
     policy: Backpressure,
     write_args: impl FnOnce(&mut [u8]),
-) {
+) -> bool {
     with_thread_buf(|tb| {
         let total_size = args_total + tb.thread_section_size as usize;
         // Drop, don't truncate, a record too large for the u16 `total_size` field.
@@ -54,9 +54,9 @@ pub fn dispatch(
         // record with a wider string encoding and a branchier decode just to rescue
         // the rare case of logging a huge buffer; a general-purpose backend that
         // prizes debugging context over a jitter spike would choose the opposite, but
-        // we do not, by design. The drop is intentionally silent and uncounted.
+        // we do not, by design. Report rejection to the caller.
         if total_size > record::MAX_RECORD_SIZE {
-            return;
+            return false;
         }
 
         if let Some(slot) = tb.ring.reserve(total_size, policy) {
@@ -77,8 +77,12 @@ pub fn dispatch(
                 write_args,
             );
             tb.ring.publish(slot);
+            true
+        } else {
+            false
         }
-    });
+    })
+    .unwrap_or(false)
 }
 
 /// Expands one logging macro. Not part of the public API; use the level
@@ -93,51 +97,72 @@ pub fn dispatch(
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __ticklog_log {
-    // Zero-argument arm: no args to encode, just the fixed record sections.
-    ($level:expr, $fmt:literal $(,)?) => {{
-        const _: () = $crate::__private::check_fmt($fmt, 0);
+    ($level:expr, $fmt:literal $(, $arg:expr)* $(,)?) => {{
         if $level <= __ticklog_max_level!() {
-            const __TOTAL: usize = $crate::__private::BASE_RECORD_SIZE;
-            $crate::__private::dispatch(
-                $level, $fmt, file!(), line!(), 0u8, __TOTAL,
-                __ticklog_backpressure!(),
-                |_buf| {},
-            );
+            let _ = $crate::__ticklog_try_log!($level, __ticklog_backpressure!(), $fmt $(, $arg)*);
         }
     }};
+}
+
+/// Shared encoder for legacy logging and the nonblocking data-log interface.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __ticklog_try_log {
+    // Zero-argument arm: no args to encode, just the fixed record sections.
+    ($level:expr, $policy:expr, $fmt:literal $(,)?) => {{
+        const _: () = $crate::__private::check_fmt($fmt, 0);
+        const __TOTAL: usize = $crate::__private::BASE_RECORD_SIZE;
+        $crate::__private::dispatch(
+            $level, $fmt, file!(), line!(), 0u8, __TOTAL,
+            $policy,
+            |_buf| {},
+        )
+    }};
     // Argument arm: monomorphized per-arg encoding, no vtable.
-    ($level:expr, $fmt:literal, $($arg:expr),+ $(,)?) => {{
+    ($level:expr, $policy:expr, $fmt:literal, $($arg:expr),+ $(,)?) => {{
         const _: () = $crate::__private::check_fmt(
             $fmt,
             <[&str]>::len(&[$(stringify!($arg)),*]),
         );
-        if $level <= __ticklog_max_level!() {
-            // Arg count is known at compile time: the same value that
-            // check_fmt validates.
-            const __N_ARGS: u8 =
-                <[&str]>::len(&[$(stringify!($arg)),*]) as u8;
-            const __BASE: usize = $crate::__private::BASE_RECORD_SIZE;
-            // Evaluate each argument expression exactly once, into a cons-list of
-            // references. Every later use reads these bindings, so a
-            // side-effecting argument runs once rather than once per use.
-            let __args = $crate::__ticklog_cons!($($arg),+);
-            let __total_size: usize = __BASE
-                .wrapping_add(__N_ARGS as usize)
-                .wrapping_add($crate::__private::LoggableArgs::args_encoded_size(&__args));
-            $crate::__private::dispatch(
-                $level, $fmt, file!(), line!(), __N_ARGS, __total_size,
-                __ticklog_backpressure!(),
-                |__buf: &mut [u8]| {
-                    // Tags fill buf[0..n_args]; payloads follow.
-                    let mut __tag: usize = 0;
-                    let mut __pay: usize = __N_ARGS as usize;
-                    $crate::__private::LoggableArgs::write_args(
-                        &__args, __buf, &mut __tag, &mut __pay,
-                    );
-                },
-            );
-        }
+        // Arg count is known at compile time: the same value that
+        // check_fmt validates.
+        const __N_ARGS: u8 =
+            <[&str]>::len(&[$(stringify!($arg)),*]) as u8;
+        const __BASE: usize = $crate::__private::BASE_RECORD_SIZE;
+        // Evaluate each argument expression exactly once, into a cons-list of
+        // references. Every later use reads these bindings, so a
+        // side-effecting argument runs once rather than once per use.
+        let __args = $crate::__ticklog_cons!($($arg),+);
+        let __total_size: usize = __BASE
+            .wrapping_add(__N_ARGS as usize)
+            .wrapping_add($crate::__private::LoggableArgs::args_encoded_size(&__args));
+        $crate::__private::dispatch(
+            $level, $fmt, file!(), line!(), __N_ARGS, __total_size,
+            $policy,
+            |__buf: &mut [u8]| {
+                // Tags fill buf[0..n_args]; payloads follow.
+                let mut __tag: usize = 0;
+                let mut __pay: usize = __N_ARGS as usize;
+                $crate::__private::LoggableArgs::write_args(
+                    &__args, __buf, &mut __tag, &mut __pay,
+                );
+            },
+        )
     }};
+}
+
+/// Attempt to enqueue one Info record without waiting for buffer space.
+///
+/// Returns `true` only after publishing the record to the caller's ring. A full
+/// ring, oversized record or re-entrant call returns `false`.
+/// This data-log interface always uses `Backpressure::Drop` and bypasses the
+/// configured level ceiling. It does not acknowledge file writes or durability.
+/// Keep its guard alive and call `warm_up` before entering a latency-sensitive path.
+#[macro_export]
+macro_rules! try_info {
+    ($fmt:literal $(, $arg:expr)* $(,)?) => {
+        $crate::__ticklog_try_log!($crate::Level::Info, $crate::Backpressure::Drop, $fmt $(, $arg)*)
+    };
 }
 
 /// Builds a cons-list of references to the given expressions, evaluating each

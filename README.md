@@ -11,11 +11,20 @@ How it works: Log calls run exclusively on the calling thread's hot path: check 
 - **Ecosystem support:** file rotation, compression, and retention come from existing crates like [logroller](https://crates.io/crates/logroller) and [tracing-appender](https://crates.io/crates/tracing-appender) (see [Examples](examples/sinks/)); anything that implements `io::Write` plugs in as a sink.
 - **Zero dependencies:** no runtime dependencies; a minimal, self-contained crate.
 
+## Fork changes
+
+This fork adds `try_info!`, which returns whether a complete record was enqueued,
+always uses Drop backpressure, and bypasses the configured diagnostic level ceiling.
+The drain thread flushes pending output and sleeps for 1 ms when all queues are
+empty, then checks for new producers on wakeup. See [PATCHES.md](PATCHES.md) for
+the behavior and regression tests, and [upstream.json](upstream.json) for provenance.
+The benchmark results below are from upstream and predate these changes.
+
 ## Installation
 
 ```toml
 [dependencies]
-ticklog = "0.1"
+ticklog = { git = "https://github.com/sqfzy/ticklog.git" }
 ```
 
 Requires Rust 1.85 or newer (edition 2024).
