@@ -20,9 +20,8 @@ empty, then checks for new producers on wakeup. See [PATCHES.md](PATCHES.md) for
 the behavior and regression tests, and [upstream.json](upstream.json) for provenance.
 The benchmark results below are from upstream and predate these changes.
 
-Enable the optional `ring-8m` Cargo feature for an 8 MiB queue per producer
-instead of the default 1 MiB when logging large bursts. Backpressure behavior
-is unchanged.
+Each producer has a 64 MiB queue by default to accommodate bursty factor logs.
+Backpressure behavior is unchanged.
 
 ## Installation
 

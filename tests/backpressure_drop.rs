@@ -17,8 +17,8 @@ use std::sync::{Arc, Condvar, Mutex};
 use ticklog::{Backpressure, Level, LogSink, info};
 
 /// More records than any ring can hold, so saturation and drops are guaranteed
-/// on every platform (a 1 MB ring holds at most ~16k of these records).
-const PRODUCED: usize = 200_000;
+/// on every platform (a 64 MiB ring holds at most 1,048,576 one-slot records).
+const PRODUCED: usize = 2_000_000;
 
 /// A one-shot gate: the drain blocks on `wait` until the test calls `open`.
 struct Gate {

@@ -10,10 +10,6 @@ repository = "https://github.com/sqfzy/ticklog"
 rust-version = "1.85"
 version = "0.1.2"
 
-[features]
-# Larger per-producer queue for bursty factor batches.
-ring-8m = []
-
 [dev-dependencies]
 criterion = {version = "0.5", features = ["html_reports"]}
 env_logger = "0.11"
