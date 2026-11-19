@@ -12,6 +12,9 @@
 //! args:    count u8 | tag u8 * count | payload bytes * count
 //! ```
 //!
+//! Byte records use the same header with the caller's kind in the flags
+//! position. Their payload follows the header directly.
+//!
 //! The format and source strings are `&'static str` referenced by pointer, not
 //! copied, so they cost nothing on the hot path and are read directly from the
 //! binary's read-only data by the drain.
@@ -26,6 +29,8 @@ pub(crate) const LOG_RECORD: u8 = 1;
 /// Record type: filler written before a ring wrap so no record straddles the
 /// physical end of the buffer.
 pub(crate) const END_OF_BUFFER: u8 = 2;
+/// Record type: application bytes delivered directly to the sink.
+pub(crate) const BYTES_RECORD: u8 = 3;
 
 /// Fixed record header size in bytes: version, type, total_size, level, flags,
 /// pad, timestamp. Summed from field widths so it tracks the layout above.
@@ -72,6 +77,29 @@ pub(crate) const FLAG_COMPLEX: u16 = 0x10;
 /// Largest record the u16 `total_size` header field can frame. A record that
 /// would encode larger than this is dropped rather than truncated.
 pub(crate) const MAX_RECORD_SIZE: usize = u16::MAX as usize;
+
+#[inline]
+pub(crate) fn assemble_bytes(dst: &mut [u8], level: Level, kind: u16, parts: &[&[u8]]) {
+    let size = (dst.len() as u16).to_le_bytes();
+    let kind = kind.to_le_bytes();
+    let (header, mut body) = dst.split_at_mut(HEADER_SIZE);
+    let mut prefix = [0; HEADER_SIZE];
+    prefix[..7].copy_from_slice(&[
+        VERSION,
+        BYTES_RECORD,
+        size[0],
+        size[1],
+        level.to_u8(),
+        kind[0],
+        kind[1],
+    ]);
+    header.copy_from_slice(&prefix);
+    for part in parts {
+        let (dst, remaining) = body.split_at_mut(part.len());
+        dst.copy_from_slice(part);
+        body = remaining;
+    }
+}
 
 /// Assembles a record by writing the fixed sections (header, format, source)
 /// into `dst`, then delegating argument encoding to the caller's

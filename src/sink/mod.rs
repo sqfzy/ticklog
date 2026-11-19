@@ -1,6 +1,6 @@
 //! Traits and adapters for log output destinations.
 //!
-//! A [`LogSink`] is the final recipient of formatted log lines. The crate ships
+//! A [`LogSink`] receives log lines and optionally tagged byte records. The crate ships
 //! three concrete sinks: [`ConsoleSink`] (the default), [`FileSink`], and the
 //! [`WriterSink`] escape hatch for any [`io::Write`]. It also provides a
 //! level-filtering adapter ([`WithLevel`]) and a multi-sink fan-out ([`FanOut`]).
@@ -17,7 +17,7 @@ pub use console::{ColorMode, ConsoleSink};
 pub use file::FileSink;
 pub use writer::WriterSink;
 
-/// A destination for formatted log lines.
+/// A destination for formatted log lines and optionally tagged byte records.
 ///
 /// The `line` passed to [`accept`](LogSink::accept) is valid UTF-8 without a
 /// trailing newline. To use any [`io::Write`] as a sink, wrap it in
@@ -29,11 +29,18 @@ pub trait LogSink: Send + 'static {
     /// require one must append it.
     fn accept(&mut self, line: &[u8], level: Level) -> io::Result<()>;
 
+    /// Receives a payload from [`crate::try_log_bytes`] on the drain thread.
+    ///
+    /// The bytes are borrowed until this call returns and may contain any
+    /// binary data. The default returns [`io::ErrorKind::Unsupported`].
+    fn accept_bytes(&mut self, _kind: u16, _payload: &[u8], _level: Level) -> io::Result<()> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
+
     /// Maximum [`Level`] this sink accepts.
     ///
-    /// Records with a level strictly greater than this value are not passed
-    /// to [`accept`](LogSink::accept). The default is [`Level::Trace`]
-    /// (accepts all levels).
+    /// [`FanOut`] uses this ceiling for both formatted and byte records.
+    /// The default is [`Level::Trace`].
     fn max_level(&self) -> Level {
         Level::Trace
     }
@@ -57,6 +64,10 @@ pub struct WithLevel<S> {
 impl<S: LogSink> LogSink for WithLevel<S> {
     fn accept(&mut self, line: &[u8], level: Level) -> io::Result<()> {
         self.sink.accept(line, level)
+    }
+
+    fn accept_bytes(&mut self, kind: u16, payload: &[u8], level: Level) -> io::Result<()> {
+        self.sink.accept_bytes(kind, payload, level)
     }
 
     fn max_level(&self) -> Level {
@@ -118,6 +129,20 @@ impl FanOut {
         self.entries.push(Box::new(sink));
         self
     }
+
+    fn dispatch(
+        &mut self,
+        level: Level,
+        mut accept: impl FnMut(&mut dyn LogSink) -> io::Result<()>,
+    ) {
+        for entry in &mut self.entries {
+            if level <= entry.max_level() {
+                if let Err(e) = accept(entry.as_mut()) {
+                    eprintln!("ticklog: sink error: {}", e);
+                }
+            }
+        }
+    }
 }
 
 impl Default for FanOut {
@@ -129,13 +154,12 @@ impl Default for FanOut {
 
 impl LogSink for FanOut {
     fn accept(&mut self, line: &[u8], level: Level) -> io::Result<()> {
-        for entry in &mut self.entries {
-            if level <= entry.max_level() {
-                if let Err(e) = entry.accept(line, level) {
-                    eprintln!("ticklog: sink error: {}", e);
-                }
-            }
-        }
+        self.dispatch(level, |entry| entry.accept(line, level));
+        Ok(())
+    }
+
+    fn accept_bytes(&mut self, kind: u16, payload: &[u8], level: Level) -> io::Result<()> {
+        self.dispatch(level, |entry| entry.accept_bytes(kind, payload, level));
         Ok(())
     }
 

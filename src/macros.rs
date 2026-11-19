@@ -13,6 +13,38 @@ use crate::record;
 use crate::thread_buf::with_thread_buf;
 use crate::timestamp;
 
+/// Copies a tagged byte payload into the calling thread's log ring.
+///
+/// The drain delivers the concatenated slices to [`crate::LogSink::accept_bytes`]
+/// in the same per-thread order as formatted records. The sink borrows the
+/// payload only during that call. Success means the record was enqueued.
+/// Like [`crate::try_info!`], this bypasses the logging level ceiling and
+/// returns `false` for a full ring, an oversized record or a re-entrant call.
+/// Configure the logger and [prewarm the thread](crate::warm_up) before use on
+/// a latency-sensitive path.
+#[inline]
+pub fn try_log_bytes(level: Level, kind: u16, parts: &[&[u8]]) -> bool {
+    let mut total_size = record::HEADER_SIZE;
+    for part in parts {
+        if part.len() > record::MAX_RECORD_SIZE - total_size {
+            return false;
+        }
+        total_size += part.len();
+    }
+    with_thread_buf(|tb| {
+        let Some(slot) = tb.ring.reserve(total_size, Backpressure::Drop) else {
+            return false;
+        };
+        // SAFETY: reserve gives the producer exclusive access to this range
+        // of initialized ring bytes until publish makes it visible to the drain.
+        let dst = unsafe { std::slice::from_raw_parts_mut(slot.ptr, total_size) };
+        record::assemble_bytes(dst, level, kind, parts);
+        tb.ring.publish(slot);
+        true
+    })
+    .unwrap_or(false)
+}
+
 /// The logging macros expand in the caller's crate, where `$crate` is `ticklog`
 /// but `crate::record` is unreachable, so they hardcode the fixed-section base
 /// record size below. This assertion keeps that literal honest: if the record

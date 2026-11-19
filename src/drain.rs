@@ -1,5 +1,5 @@
-//! The drain thread: consumes encoded records from every registered ring
-//! buffer and writes formatted log lines to the sink.
+//! The drain thread consumes encoded records from each registered ring and
+//! dispatches them to the sink.
 //!
 //! This is the only module that performs raw-pointer arithmetic. All byte
 //! access goes through [`Cursor`], the sole audit point for unsafe reads.
@@ -12,8 +12,8 @@ use crate::encode::{FIXED_SIZES, TAG_COUNT, TAG_STR};
 use crate::format::{self, Field, FormatSpec, Segment, Template};
 use crate::level::Level;
 use crate::record::{
-    END_OF_BUFFER, FLAG_COMPLEX, FLAG_FORMAT, FLAG_PROCESS, FLAG_SOURCE, FLAG_THREAD, HEADER_SIZE,
-    LOG_RECORD, VERSION,
+    BYTES_RECORD, END_OF_BUFFER, FLAG_COMPLEX, FLAG_FORMAT, FLAG_PROCESS, FLAG_SOURCE, FLAG_THREAD,
+    HEADER_SIZE, LOG_RECORD, VERSION,
 };
 use crate::ring::{RING_SIZE, RingBuffer, SLOT_SIZE, align_up};
 use crate::sink::LogSink;
@@ -470,7 +470,7 @@ fn drain_ring(
         // never fires; if it does, resync to the producer's published head and
         // resume rather than walk off into garbage.
         if version != VERSION
-            || (rectype != LOG_RECORD && rectype != END_OF_BUFFER)
+            || !matches!(rectype, LOG_RECORD | END_OF_BUFFER | BYTES_RECORD)
             || total_size < HEADER_SIZE as u64
             || offset + total_size as usize > RING_SIZE
         {
@@ -495,9 +495,15 @@ fn drain_ring(
             .and_then(|&b| Level::from_u8(b))
             .unwrap_or(Level::Error);
 
-        buf.clear();
-        decode_and_format(record, timezone_offset, calibration, line_pattern, buf);
-        if let Err(e) = sink.accept(buf, level) {
+        let result = if rectype == BYTES_RECORD {
+            let kind = u16::from_le_bytes([record[5], record[6]]);
+            sink.accept_bytes(kind, &record[HEADER_SIZE..], level)
+        } else {
+            buf.clear();
+            decode_and_format(record, timezone_offset, calibration, line_pattern, buf);
+            sink.accept(buf, level)
+        };
+        if let Err(e) = result {
             eprintln!("ticklog: sink accept failed: {}", e);
         }
 
@@ -1242,6 +1248,51 @@ mod tests {
         assert_eq!(ring.tail.load(Ordering::Relaxed), head);
         drop(recorded);
         assert!(!drain.poll_once(mask, &mut buf));
+    }
+
+    #[test]
+    fn poll_delivers_byte_record_after_wrap() {
+        struct BytesSink(Option<(u16, Vec<u8>, Level)>);
+        impl LogSink for BytesSink {
+            fn accept(&mut self, _: &[u8], _: Level) -> io::Result<()> {
+                unreachable!("a byte record must bypass formatting");
+            }
+
+            fn accept_bytes(&mut self, kind: u16, bytes: &[u8], level: Level) -> io::Result<()> {
+                self.0 = Some((kind, bytes.to_vec(), level));
+                Ok(())
+            }
+        }
+
+        let ring = RingBuffer::new();
+        let near_end = (RING_SIZE - SLOT_SIZE) as u64;
+        ring.head.store(near_end, Ordering::Relaxed);
+        ring.tail.store(near_end, Ordering::Relaxed);
+        // SAFETY: this test is the only reader and writer of the ring.
+        unsafe { *ring.head_cache.get() = near_end };
+        let payload = [0xff; SLOT_SIZE];
+        let len = HEADER_SIZE + payload.len();
+        let slot = ring.reserve(len, crate::Backpressure::Drop).unwrap();
+        // SAFETY: the producer owns this initialized, reserved range.
+        let dst = unsafe { std::slice::from_raw_parts_mut(slot.ptr, len) };
+        crate::record::assemble_bytes(dst, Level::Info, 0xabcd, &[&payload]);
+        ring.publish(slot);
+
+        let mut sink = BytesSink(None);
+        assert!(drain_ring(
+            &ring,
+            (RING_SIZE - 1) as u64,
+            &mut sink,
+            0,
+            &identity_calibration(),
+            &default_line_pattern(),
+            &mut Vec::new()
+        ));
+        assert_eq!(sink.0, Some((0xabcd, payload.to_vec(), Level::Info)));
+        assert_eq!(
+            ring.tail.load(Ordering::Relaxed),
+            ring.head.load(Ordering::Relaxed)
+        );
     }
 
     #[test]
