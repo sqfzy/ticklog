@@ -20,13 +20,14 @@ use crate::timestamp;
 /// payload only during that call. Success means the record was enqueued.
 /// Like [`crate::try_info!`], this bypasses the logging level ceiling and
 /// returns `false` for a full ring, an oversized record or a re-entrant call.
+/// The slices may contain up to [`crate::MAX_BYTES_PAYLOAD_SIZE`] bytes in total.
 /// Configure the logger and [prewarm the thread](crate::warm_up) before use on
 /// a latency-sensitive path.
 #[inline]
 pub fn try_log_bytes(level: Level, kind: u16, parts: &[&[u8]]) -> bool {
     let mut total_size = record::HEADER_SIZE;
     for part in parts {
-        if part.len() > record::MAX_RECORD_SIZE - total_size {
+        if part.len() > record::MAX_BYTES_RECORD_SIZE - total_size {
             return false;
         }
         total_size += part.len();
@@ -78,15 +79,7 @@ pub fn dispatch(
 ) -> bool {
     with_thread_buf(|tb| {
         let total_size = args_total + tb.thread_section_size as usize;
-        // Drop, don't truncate, a record too large for the u16 `total_size` field.
-        //
-        // ticklog targets ultra-low-latency hot paths (e.g. trade execution) where
-        // keeping the producer thread alive and honoring timing guarantees outranks
-        // capturing every byte of a pathological payload. Truncating would tax every
-        // record with a wider string encoding and a branchier decode just to rescue
-        // the rare case of logging a huge buffer; a general-purpose backend that
-        // prizes debugging context over a jitter spike would choose the opposite, but
-        // we do not, by design. Report rejection to the caller.
+        // Bound the work done on the producer for a formatted record.
         if total_size > record::MAX_RECORD_SIZE {
             return false;
         }

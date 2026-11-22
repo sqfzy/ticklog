@@ -4,7 +4,7 @@ use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::builder::Backpressure;
-use crate::record::{END_OF_BUFFER, MAX_RECORD_SIZE, VERSION};
+use crate::record::{END_OF_BUFFER, MAX_BYTES_RECORD_SIZE, PREFIX_SIZE, frame_prefix};
 
 /// Cache-line size in bytes.
 ///
@@ -152,10 +152,7 @@ impl RingBuffer {
     /// `head` and `tail_cache`.
     #[inline]
     pub(crate) fn reserve(&self, total_size: usize, policy: Backpressure) -> Option<Reservation> {
-        debug_assert!(
-            total_size <= MAX_RECORD_SIZE,
-            "invariant: total_size must fit the u16 total_size field"
-        );
+        debug_assert!(total_size <= MAX_BYTES_RECORD_SIZE);
         let total = total_size as u64;
         let aligned = align_up(total, SLOT_SIZE as u64);
 
@@ -190,11 +187,10 @@ impl RingBuffer {
 
         let mut next = head;
         if wrap {
-            // `remaining_phys < aligned <= 65536` here (see the top of this fn),
-            // so the u16 cast is exact.
+            let prefix = frame_prefix(END_OF_BUFFER, remaining_phys as usize, 0, 0);
             // SAFETY: `offset` starts a slot-aligned region of `remaining_phys`
-            // bytes inside the ring; the EOB header occupies its first 4 bytes.
-            unsafe { write_eob(base.add(offset), remaining_phys as u16) };
+            // bytes inside the ring. A slot contains the whole frame prefix.
+            unsafe { base.add(offset).cast::<[u8; PREFIX_SIZE]>().write(prefix) };
             next = next.wrapping_add(remaining_phys);
         }
 
@@ -254,26 +250,6 @@ impl RingBuffer {
                 }
             }
         }
-    }
-}
-
-/// Writes a header-only `END_OF_BUFFER` record of `span` bytes at `ptr`.
-///
-/// The drain reads only the 4-byte prefix (version, type, total_size), then
-/// skips the whole span and wraps to the start of the ring.
-///
-/// # Safety
-///
-/// `ptr` must start a writable region of at least 4 bytes within the ring's
-/// data allocation.
-unsafe fn write_eob(ptr: *mut u8, span: u16) {
-    let size = span.to_le_bytes();
-    // SAFETY: the caller guarantees `ptr..ptr+4` is writable and in-bounds.
-    unsafe {
-        ptr.write(VERSION);
-        ptr.add(1).write(END_OF_BUFFER);
-        ptr.add(2).write(size[0]);
-        ptr.add(3).write(size[1]);
     }
 }
 
@@ -519,11 +495,9 @@ mod tests {
         let data = unsafe { std::slice::from_raw_parts(rb.data.as_ptr() as *const u8, RING_SIZE) };
         // EOB header sits at the old offset and spans exactly one slot.
         let eob = (start & (RING_SIZE as u64 - 1)) as usize;
-        assert_eq!(data[eob], VERSION);
-        assert_eq!(data[eob + 1], END_OF_BUFFER);
         assert_eq!(
-            u16::from_le_bytes([data[eob + 2], data[eob + 3]]) as u64,
-            slot
+            data[eob..eob + PREFIX_SIZE],
+            frame_prefix(END_OF_BUFFER, SLOT_SIZE, 0, 0),
         );
         // The record wrapped to offset 0.
         assert_eq!(&data[..record.len()], &record[..]);

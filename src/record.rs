@@ -5,7 +5,7 @@
 //! record is a fixed 16-byte header followed by flagged sections:
 //!
 //! ```text
-//! header:  version u8 | type u8 | total_size u16 | level u8 | flags u16 | pad u8 | timestamp u64
+//! header:  version u8 | type u8 | total_size u24 | level u8 | flags u16 | timestamp u64
 //! format:  fmt_ptr u64 | fmt_len u16                          (FLAG_FORMAT)
 //! source:  file_ptr u64 | file_len u16 | line u32             (FLAG_SOURCE)
 //! thread:  thread_id u64 | name_len u16 | name bytes          (FLAG_THREAD)
@@ -23,7 +23,7 @@ use crate::level::Level;
 use core::mem::size_of;
 
 /// Record format version written in byte 0 of every header.
-pub(crate) const VERSION: u8 = 0x01;
+pub(crate) const VERSION: u8 = 0x02;
 /// Record type: a normal encoded log record.
 pub(crate) const LOG_RECORD: u8 = 1;
 /// Record type: filler written before a ring wrap so no record straddles the
@@ -32,15 +32,9 @@ pub(crate) const END_OF_BUFFER: u8 = 2;
 /// Record type: application bytes delivered directly to the sink.
 pub(crate) const BYTES_RECORD: u8 = 3;
 
-/// Fixed record header size in bytes: version, type, total_size, level, flags,
-/// pad, timestamp. Summed from field widths so it tracks the layout above.
-pub(crate) const HEADER_SIZE: usize = size_of::<u8>()  // version
-    + size_of::<u8>()   // type
-    + size_of::<u16>()  // total_size
-    + size_of::<u8>()   // level
-    + size_of::<u16>()  // flags
-    + size_of::<u8>()   // _pad
-    + size_of::<u64>(); // timestamp
+/// Header bytes preceding the timestamp, also used by the ring wrap marker.
+pub(crate) const PREFIX_SIZE: usize = 8;
+pub(crate) const HEADER_SIZE: usize = PREFIX_SIZE + size_of::<u64>();
 /// Encoded size of the format section: an 8-byte pointer and a 2-byte length.
 pub(crate) const FORMAT_SECTION_SIZE: usize = size_of::<u64>()  // fmt_ptr
     + size_of::<u16>(); // fmt_len
@@ -74,26 +68,28 @@ pub(crate) const FLAG_PROCESS: u16 = 0x08;
 /// Flag bit: the complex-type section is present.
 pub(crate) const FLAG_COMPLEX: u16 = 0x10;
 
-/// Largest record the u16 `total_size` header field can frame. A record that
-/// would encode larger than this is dropped rather than truncated.
+/// Formatted records retain their size limit and u16 string lengths.
 pub(crate) const MAX_RECORD_SIZE: usize = u16::MAX as usize;
+pub(crate) const MAX_BYTES_RECORD_SIZE: usize = 128 * 1024;
+
+/// Maximum combined length of the slices passed to [`crate::try_log_bytes`].
+pub const MAX_BYTES_PAYLOAD_SIZE: usize = MAX_BYTES_RECORD_SIZE - HEADER_SIZE;
+
+#[inline]
+pub(crate) fn frame_prefix(rectype: u8, size: usize, level: u8, flags: u16) -> [u8; PREFIX_SIZE] {
+    let [size_lo, size_mid, size_hi, _] = (size as u32).to_le_bytes();
+    let [flags_lo, flags_hi] = flags.to_le_bytes();
+    [
+        VERSION, rectype, size_lo, size_mid, size_hi, level, flags_lo, flags_hi,
+    ]
+}
 
 #[inline]
 pub(crate) fn assemble_bytes(dst: &mut [u8], level: Level, kind: u16, parts: &[&[u8]]) {
-    let size = (dst.len() as u16).to_le_bytes();
-    let kind = kind.to_le_bytes();
+    let prefix = frame_prefix(BYTES_RECORD, dst.len(), level.to_u8(), kind);
     let (header, mut body) = dst.split_at_mut(HEADER_SIZE);
-    let mut prefix = [0; HEADER_SIZE];
-    prefix[..7].copy_from_slice(&[
-        VERSION,
-        BYTES_RECORD,
-        size[0],
-        size[1],
-        level.to_u8(),
-        kind[0],
-        kind[1],
-    ]);
-    header.copy_from_slice(&prefix);
+    header[..PREFIX_SIZE].copy_from_slice(&prefix);
+    header[PREFIX_SIZE..].fill(0);
     for part in parts {
         let (dst, remaining) = body.split_at_mut(part.len());
         dst.copy_from_slice(part);
@@ -136,9 +132,6 @@ pub(crate) fn assemble(
     total_size: usize,
     write_args: impl FnOnce(&mut [u8]),
 ) {
-    let total = total_size as u16;
-    let level_u8 = level.to_u8();
-
     debug_assert!(total_size <= MAX_RECORD_SIZE);
     debug_assert!(fmt.len() <= u16::MAX as usize);
     debug_assert!(file.len() <= u16::MAX as usize);
@@ -163,12 +156,7 @@ pub(crate) fn assemble(
         }
 
         // Header
-        put!([VERSION]);
-        put!([LOG_RECORD]);
-        put!(total.to_le_bytes());
-        put!([level_u8]);
-        put!(flags.to_le_bytes());
-        put!([0u8]); // _pad
+        put!(frame_prefix(LOG_RECORD, total_size, level.to_u8(), flags));
         put!(timestamp.to_le_bytes());
 
         // Format section
@@ -304,9 +292,9 @@ mod tests {
         assert_eq!(buf[0], VERSION);
         assert_eq!(buf[1], LOG_RECORD);
         assert_eq!(read_u16(&buf, 2) as usize, buf.len());
-        assert_eq!(buf[4], Level::Warn.to_u8());
-        assert_eq!(read_u16(&buf, 5), FLAG_FORMAT | FLAG_SOURCE | FLAG_THREAD);
-        assert_eq!(buf[7], 0);
+        assert_eq!(buf[4], 0);
+        assert_eq!(buf[5], Level::Warn.to_u8());
+        assert_eq!(read_u16(&buf, 6), FLAG_FORMAT | FLAG_SOURCE | FLAG_THREAD);
         assert_eq!(read_u64(&buf, 8), 0xABCD);
     }
 
@@ -381,7 +369,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_record_larger_than_u16_total_size() {
+    fn rejects_formatted_record_above_size_limit() {
         // A string argument just large enough to push total_size past u16::MAX.
         let big = "x".repeat(u16::MAX as usize);
         let mut buf = Vec::new();
@@ -426,7 +414,7 @@ mod tests {
         unsafe { buf.set_len(total_size) };
 
         // Flags in header must only have FLAG_FORMAT.
-        assert_eq!(read_u16(&buf, 5), FLAG_FORMAT);
+        assert_eq!(read_u16(&buf, 6), FLAG_FORMAT);
 
         // Count byte must be right after the format section, no source
         // or thread bytes in between.

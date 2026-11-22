@@ -11,6 +11,11 @@ level ceiling, and does not acknowledge disk writes. Existing logging macros kee
 their original behavior and unit return value. The app counts rejected records
 on the producer thread, without shared atomic increments for each attempted log.
 
+Tagged byte records support a 128 KiB frame, including the 16-byte header.
+`MAX_BYTES_PAYLOAD_SIZE` exposes the usable bytes to callers that prepare a
+payload in a scratch buffer. The ring uses a 24-bit length for both records
+and wrap markers. Formatted records retain their 65,535-byte frame limit.
+
 The drain flushes pending output and sleeps for 1 ms when every queue is empty,
 instead of busy-spinning. On wakeup it refreshes the producer registry immediately;
 the 1024-poll registry cadence still applies during continuous draining. Records

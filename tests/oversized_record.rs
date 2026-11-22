@@ -1,16 +1,4 @@
-//! Regression: a record too large for the u16 `total_size` field must be
-//! dropped, never written with a truncated header.
-//!
-//! Without the size gate in `dispatch`, logging a string of ~70 KB makes
-//! `total_size` (70_044) overflow the u16 header field: it is stored as
-//! `70_044 & 0xFFFF = 4508`, but the producer still copies all 70_044 bytes into
-//! the ring and advances `head` by the true length. The drain then frames only
-//! 4508 bytes, lands mid-payload, and reinterprets the interior of the oversized
-//! record as the next record -- so a normal record logged right after is
-//! misframed (in a debug build the `debug_assert` in `assemble` fires first).
-//!
-//! With the gate, the oversized record is dropped and the following record
-//! arrives intact. This test proves the sentinel survives.
+//! Oversized formatted records are rejected without interrupting the log stream.
 
 use std::sync::{Arc, Mutex};
 
@@ -44,8 +32,7 @@ fn oversized_record_is_dropped_and_next_record_survives() {
     }
     .expect("first configure in a fresh process must succeed");
 
-    // ~70 KB argument: encoded record size exceeds u16::MAX (65_535). Without
-    // the drop gate this misframes the ring (or trips the debug_assert).
+    // The encoded record exceeds the formatted record limit.
     let huge = "x".repeat(70_000);
     info!("huge={}", huge);
 

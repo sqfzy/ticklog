@@ -13,7 +13,7 @@ use crate::format::{self, Field, FormatSpec, Segment, Template};
 use crate::level::Level;
 use crate::record::{
     BYTES_RECORD, END_OF_BUFFER, FLAG_COMPLEX, FLAG_FORMAT, FLAG_PROCESS, FLAG_SOURCE, FLAG_THREAD,
-    HEADER_SIZE, LOG_RECORD, VERSION,
+    HEADER_SIZE, LOG_RECORD, MAX_BYTES_RECORD_SIZE, PREFIX_SIZE, VERSION,
 };
 use crate::ring::{RING_SIZE, RingBuffer, SLOT_SIZE, align_up};
 use crate::sink::LogSink;
@@ -451,20 +451,28 @@ fn drain_ring(
     while tail < head_cache {
         let offset = (tail & mask) as usize;
 
-        // SAFETY: `offset` is within the ring; the prefix cursor is bounded to
-        // the bytes from `offset` to the end of the ring storage.
-        let (version, rectype, total_size) = unsafe {
+        // SAFETY: `tail` is slot-aligned and below `head_cache`, so the
+        // published slot at `offset` contains the full prefix.
+        let [
+            version,
+            rectype,
+            size_lo,
+            size_mid,
+            size_hi,
+            level,
+            flags_lo,
+            flags_hi,
+        ] = unsafe {
             let mut c = Cursor::new(base.add(offset), RING_SIZE - offset);
-            let version = c.read_u8();
-            let rectype = c.read_u8();
-            let total_size = c.read_u16() as u64;
-            (version, rectype, total_size)
+            c.read_array::<PREFIX_SIZE>()
         };
+        let total_size = u32::from_le_bytes([size_lo, size_mid, size_hi, 0]) as u64;
 
         if total_size == 0 {
             break; // empty slot: nothing more published in this ring
         }
 
+        let aligned_size = align_up(total_size, SLOT_SIZE as u64);
         // Layer A: reject a corrupt frame before trusting `total_size` to slice
         // or advance the tail. On a cooperative single-process channel this
         // never fires; if it does, resync to the producer's published head and
@@ -472,7 +480,9 @@ fn drain_ring(
         if version != VERSION
             || !matches!(rectype, LOG_RECORD | END_OF_BUFFER | BYTES_RECORD)
             || total_size < HEADER_SIZE as u64
-            || offset + total_size as usize > RING_SIZE
+            || total_size > MAX_BYTES_RECORD_SIZE as u64
+            || aligned_size > (RING_SIZE - offset) as u64
+            || aligned_size > head_cache - tail
         {
             eprintln!(
                 "ticklog: drain discarded a corrupt record \
@@ -483,20 +493,17 @@ fn drain_ring(
         }
 
         if rectype == END_OF_BUFFER {
-            tail += align_up(total_size, SLOT_SIZE as u64);
+            tail += aligned_size;
             continue; // `tail & mask` wraps to 0 at the ring boundary
         }
 
         // SAFETY: `total_size` frames one complete record inside the ring
         // (validated above), so this slice is initialized and in-bounds.
         let record = unsafe { std::slice::from_raw_parts(base.add(offset), total_size as usize) };
-        let level = record
-            .get(4)
-            .and_then(|&b| Level::from_u8(b))
-            .unwrap_or(Level::Error);
+        let level = Level::from_u8(level).unwrap_or(Level::Error);
 
         let result = if rectype == BYTES_RECORD {
-            let kind = u16::from_le_bytes([record[5], record[6]]);
+            let kind = u16::from_le_bytes([flags_lo, flags_hi]);
             sink.accept_bytes(kind, &record[HEADER_SIZE..], level)
         } else {
             buf.clear();
@@ -507,7 +514,7 @@ fn drain_ring(
             eprintln!("ticklog: sink accept failed: {}", e);
         }
 
-        tail += align_up(total_size, SLOT_SIZE as u64);
+        tail += aligned_size;
     }
 
     // Publish the consumed position. Release pairs with the producer's Acquire
@@ -546,10 +553,9 @@ fn decode_and_format(
     // version/type/total_size prefix was consumed by the poll loop.
     // SAFETY: the 16-byte header is present for every LOG_RECORD.
     let (level_byte, flags, timestamp) = unsafe {
-        c.skip(4); // version, type, total_size
+        c.skip(5); // version, type, total_size
         let level_byte = c.read_u8();
         let flags = c.read_u16();
-        c.skip(1); // _pad
         let timestamp = c.read_u64();
         (level_byte, flags, timestamp)
     };
@@ -806,9 +812,7 @@ mod tests {
     use super::*;
     use crate::builder::DEFAULT_LINE_PATTERN;
     use crate::encode::{TAG_BOOL, TAG_F64, TAG_I64, TAG_U16, TAG_U64};
-    use crate::record::{
-        FORMAT_SECTION_SIZE, HEADER_SIZE, LOG_RECORD, THREAD_SECTION_BASE_SIZE, VERSION,
-    };
+    use crate::record::{FORMAT_SECTION_SIZE, THREAD_SECTION_BASE_SIZE, frame_prefix};
     use std::io;
     use std::sync::{Mutex, OnceLock};
 
@@ -887,15 +891,10 @@ mod tests {
             payload.extend_from_slice(data);
         }
 
-        let total_size = (HEADER_SIZE + payload.len()) as u16;
+        let total_size = HEADER_SIZE + payload.len();
 
-        let mut record = Vec::with_capacity(total_size as usize);
-        record.push(VERSION); // version
-        record.push(LOG_RECORD); // type
-        record.extend_from_slice(&total_size.to_le_bytes());
-        record.push(level.to_u8());
-        record.extend_from_slice(&flags.to_le_bytes());
-        record.push(0); // _pad
+        let mut record = Vec::with_capacity(total_size);
+        record.extend_from_slice(&frame_prefix(LOG_RECORD, total_size, level.to_u8(), flags));
         record.extend_from_slice(&timestamp.to_le_bytes());
         record.extend_from_slice(&payload);
         record
@@ -1251,7 +1250,7 @@ mod tests {
     }
 
     #[test]
-    fn poll_delivers_byte_record_after_wrap() {
+    fn poll_delivers_largest_byte_record_after_wide_wrap() {
         struct BytesSink(Option<(u16, Vec<u8>, Level)>);
         impl LogSink for BytesSink {
             fn accept(&mut self, _: &[u8], _: Level) -> io::Result<()> {
@@ -1265,12 +1264,13 @@ mod tests {
         }
 
         let ring = RingBuffer::new();
-        let near_end = (RING_SIZE - SLOT_SIZE) as u64;
+        // The wrap marker also needs more than 16 bits to encode its span.
+        let near_end = (RING_SIZE - 64 * 1024) as u64;
         ring.head.store(near_end, Ordering::Relaxed);
         ring.tail.store(near_end, Ordering::Relaxed);
         // SAFETY: this test is the only reader and writer of the ring.
         unsafe { *ring.head_cache.get() = near_end };
-        let payload = [0xff; SLOT_SIZE];
+        let payload = vec![0xff; crate::MAX_BYTES_PAYLOAD_SIZE];
         let len = HEADER_SIZE + payload.len();
         let slot = ring.reserve(len, crate::Backpressure::Drop).unwrap();
         // SAFETY: the producer owns this initialized, reserved range.
@@ -1288,7 +1288,7 @@ mod tests {
             &default_line_pattern(),
             &mut Vec::new()
         ));
-        assert_eq!(sink.0, Some((0xabcd, payload.to_vec(), Level::Info)));
+        assert_eq!(sink.0, Some((0xabcd, payload, Level::Info)));
         assert_eq!(
             ring.tail.load(Ordering::Relaxed),
             ring.head.load(Ordering::Relaxed)
@@ -1333,11 +1333,8 @@ mod tests {
         let ring = Arc::new(RingBuffer::new());
 
         // An EOB record spanning one slot, followed by a real record.
-        let mut eob = Vec::new();
-        eob.push(0x01); // version
-        eob.push(END_OF_BUFFER); // type
-        eob.extend_from_slice(&(SLOT_SIZE as u16).to_le_bytes()); // total_size
-        eob.resize(SLOT_SIZE, 0); // pad to a full slot
+        let mut eob = [0; SLOT_SIZE];
+        eob[..PREFIX_SIZE].copy_from_slice(&frame_prefix(END_OF_BUFFER, SLOT_SIZE, 0, 0));
         place_record(&ring, 0, &eob);
 
         let record = build_record(Level::Info, 0, "hi", Some(("", 0)), 1, None, &[]);

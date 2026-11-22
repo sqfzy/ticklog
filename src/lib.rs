@@ -161,6 +161,7 @@ pub use error::TicklogError;
 pub use guard::Guard;
 pub use level::Level;
 pub use macros::try_log_bytes;
+pub use record::MAX_BYTES_PAYLOAD_SIZE;
 pub use sink::{
     ColorMode, ConsoleSink, FanOut, FileSink, LogSink, LogSinkExt, WithLevel, WriterSink,
 };
